@@ -1,0 +1,169 @@
+--==-- Read me! --==--
+/*  Use this to generate a script of insert statements for missing data, based on primary key columns	*
+*	Setting the @MySchema or @MyTableName variables will get you specific table(s)						*
+*	Set to text output																					*
+*	Run against the environment with good data															*/
+
+USE --> INSERT DATABASE NAME <--
+GO
+
+set nocount on;
+
+declare @MySchema varchar(100) = null
+declare @MyTableName varchar(100) = null
+declare @OnlyRefData bit = 0		  --Only script ref data, meaning it has something foreign keyed to it
+declare @RowLimit varchar(10) = '500' --This is to save you from excessive output, change as needed.
+
+if OBJECT_ID(N'tempdb.dbo.#temp') is not null
+	drop table #temp
+
+select tableName = t.name, schemaName = s.name
+	into #temp
+from sys.tables t with (nolocK)
+  inner join sys.schemas s with (nolock)
+	on s.schema_id = t.schema_id
+where 1=1
+and (s.name = @MySchema OR @MySchema is null)
+and (t.name = @MyTableName OR @MyTableName is null)
+and (@OnlyRefData = 0
+	OR (@OnlyRefData = 1 and exists(select * from sys.foreign_keys chk with (nolock) where chk.referenced_object_id = t.object_id)) 
+	) 
+
+declare @tableName varchar(255)
+declare @SchemaName varchar(255)
+declare @columnName nvarchar(255)
+declare @sql nvarchar(max)
+declare @colList nvarchar(max) = ''
+declare @joinList nvarchar(max) = ''
+declare @cteList nvarchar(max) = ''
+declare @is_nullable bit
+declare @insertList nvarchar(max)
+declare @pk varchar(255)
+declare @identity tinyint = 0
+declare @rows table (cnt int)
+
+while exists(select * from #temp)
+begin
+
+	select top (1) @tableName = tableName, @SchemaName = schemaName 
+	from #temp
+
+	set @joinList = ''; set @colList = ''; set @columnName = ''; set @insertList = ''; set @cteList = ''; set @identity = 0
+	delete from @rows
+
+	if OBJECT_ID(N'tempdb.dbo.#cols') is not null
+		drop table #cols
+
+	insert into @rows (cnt)
+	exec (N'select count(*) from (select top ('+@RowLimit+') * from '+@SchemaName+'.'+@tableName+' with (nolock) ) a')
+
+	if exists(select * from @rows where cnt >= convert(int,@RowLimit) )
+	begin
+		PRINT '--Ignoring this table because its too large: '+@SchemaName+'.'+@tableName
+		
+		delete from #temp
+		where @tableName = tableName
+
+		continue; --dont do this one
+	end
+
+	select t.name as tableName
+	, c.name as columnName
+	, ccu.CONSTRAINT_NAME
+	, CONVERT(int, 0) as status
+	, CONVERT(int, 0) as insert_status
+	, ROW_NUMBER() over (order by ccu.constraint_name asc, c.name asc) as rank
+	, c.is_nullable
+	, c.is_identity
+	into #cols
+	from sys.tables t with (nolock)
+		inner join sys.schemas s with (nolock)
+			on t.schema_id = s.schema_id
+		inner join sys.columns c with (nolock)
+			on t.object_id = c.object_id
+		left outer join INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc with (nolock)
+			on tc.TABLE_NAME = t.name
+			and tc.table_schema = s.name
+        left outer join INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE ccu  with (nolock)
+			ON tc.CONSTRAINT_NAME = ccu.Constraint_name
+			and tc.CONSTRAINT_TYPE = 'Primary Key'
+			and ccu.column_name = c.name
+		where t.name = @tableName
+		and s.name = @SchemaName 
+	
+	while exists (select * from #cols where insert_status = 0)
+	begin
+
+		select @columnName = columnName, @is_nullable = is_nullable, @pk = CONSTRAINT_NAME, @identity = @identity + convert(tinyint,is_identity)
+		from #cols 
+		where insert_status = 0
+		
+		set @insertList = @insertList + ', '+@columnName
+		set @cteList = @cteList + ', ''+isnull(''''''''+replace(convert(varchar(max),'+@columnName+'),'''''''','''''''''''')+'''''''',''null'')+'' '
+		
+		update #cols
+		set insert_status = 1
+		where columnName = @columnName
+
+	end
+		
+	 --remove some excessive punctuation
+	set @cteList = @cteList +''
+	set @insertList = stuff(@insertList,1,1,'')	
+	set @cteList = stuff(@cteList,1,3,'')
+	set @cteList = stuff(@cteList,LEN(@cteList)-1,2,'')
+	
+	--Find the key columns
+	while exists (select 1  from #cols where status = 0 and CONSTRAINT_NAME is not null)
+	begin
+
+		select @columnName = columnName, @is_nullable = is_nullable
+		from #cols 
+		where status = 0 
+		and CONSTRAINT_NAME is not null
+
+		set @joinList = @joinList + case @is_nullable when 0 then '
+								and mast.'+@columnName + ' = e.' + @columnName
+									else '
+								and ((mast.'+@columnName+' = e.' + @columnName+') OR (mast.'+@columnName+' is null and e.'+@columnName+' is null))'
+								end 
+
+		update #cols
+		set status = 1
+		where columnName = @columnName
+
+	end
+
+--Output our insert commands
+PRINT N'
+--=='+@SchemaName+'_'+@tablename+'==--
+'
+
+if @identity > 0
+PRINT N'set identity_insert '+@SchemaName+'.'+@tablename+' on;'
+
+PRINT N'
+; with myinsert ('+@insertList+') as
+(
+'
+Exec (N'
+select case when rn!=1 then ''union all select '' else ''select '' end
+'+@cteList+' from (select *,rn=ROW_NUMBER() over(order by getdate()) from '+@SchemaName+'.'+@tablename+') x')
+
+Print N'
+)
+insert into '+@SchemaName+'.'+@tablename+' ('+@insertList+')
+select '+@insertList+'
+from myinsert e
+where not exists (select ''x'' from '+@SchemaName+'.'+@tablename+' mast with (nolock) where 1=1'+@joinList+')
+'
+
+if @identity > 0
+PRINT N'set identity_insert '+@SchemaName+'.'+@tablename+' off;'
+
+Print N'
+GO
+'
+	delete from #temp
+	where @tableName = tableName
+end
